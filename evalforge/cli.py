@@ -6,7 +6,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .evaluator import DeepSeekEvaluator, EvaluationError, EvaluationResult, MODEL
+from .evaluator import (
+    MODEL_A,
+    DeepSeekEvaluator,
+    EvaluationError,
+    EvaluationResult,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -87,7 +92,8 @@ def evaluate_all(
             review_text = "，需人工复核" if result.needs_review else ""
             print(
                 f"  {ANSWER_TYPE_LABELS[answer_type]}答案：{score_text} 分{review_text}。"
-                f"关键词覆盖：{result.coverage_ratio:.0%}。评分理由：{result.reason}"
+                f"关键词覆盖：{result.coverage_ratio:.0%}。"
+                f"判定来源：{result.stage}/{result.model}。评分理由：{result.reason}"
             )
             if result.needs_review:
                 print(f"    复核问题：{'；'.join(result.review_issues)}")
@@ -128,6 +134,8 @@ def check_score_acceptance(
 def run_stability_check(
     evaluator: DeepSeekEvaluator, cases: list[dict[str, Any]]
 ) -> list[str]:
+    # 固定样本：第 1 个问题的正确答案、第 2 个问题的部分正确答案、
+    # 第 3 个问题的错误答案。每条固定运行 3 次。
     selections = zip(cases[:3], REQUIRED_TYPES, strict=True)
     failures: list[str] = []
     print("\n稳定性测试（每条固定样本运行 3 次）：")
@@ -160,7 +168,7 @@ def run_stability_check(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="EvalForge v1.1 LLM + Python 答案评测")
+    parser = argparse.ArgumentParser(description="EvalForge v1.2 双模型 + Python 答案评测")
     parser.add_argument(
         "--data", type=Path, default=DEFAULT_DATA_PATH, help="测试数据 JSON 路径"
     )
@@ -177,7 +185,10 @@ def main() -> int:
     try:
         cases = load_test_cases(args.data)
         evaluator = DeepSeekEvaluator()
-        print(f"EvalForge v1.1 开始评测：模型固定为 {MODEL}，共 {len(cases)} 个问题。")
+        print(
+            f"EvalForge v1.2 开始评测：模型 A={evaluator.model_a}，"
+            f"模型 B={evaluator.model_b or '未配置'}，共 {len(cases)} 个问题。"
+        )
         results = evaluate_all(evaluator, cases)
         failures = check_score_acceptance(cases, results)
         if args.acceptance:

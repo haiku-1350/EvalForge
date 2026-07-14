@@ -1,10 +1,16 @@
-"""EvalForge v1.1: LLM evaluation with deterministic Python review."""
+"""EvalForge: an LLM evaluation pipeline with deterministic Python review."""
 
-from .evaluator import EvaluationError, EvaluationResult, DeepSeekEvaluator
+from .evaluator import (
+    DeepSeekEvaluator,
+    EvaluationAttempt,
+    EvaluationError,
+    EvaluationResult,
+)
 from .reviewer import ReviewReport, review_content, review_result
 
 __all__ = [
     "DeepSeekEvaluator",
+    "EvaluationAttempt",
     "EvaluationError",
     "EvaluationResult",
     "ReviewReport",

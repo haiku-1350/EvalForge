@@ -1,4 +1,4 @@
-# EvalForge v1.1
+# EvalForge v1.2
 
 这是一个带 Python 复核的 LLM 答案评测流程：从 JSON 读取问题、参考答案和三类 RAG 待评估答案，调用固定的 DeepSeek 模型评分并提取参考答案关键词，再用确定性的 Python 规则复核结果。
 
@@ -19,7 +19,20 @@ Python 会依次检查：
 
 覆盖率最低要求为：2 分至少覆盖 1 个关键词，3 分至少 50%，4 分至少 75%，5 分必须 100%。0 到 1 分不做反向覆盖限制，因为包含关键词的答案仍可能通过否定、错配等方式与参考答案矛盾。
 
-首次结果未通过复核时，程序会把具体问题反馈给 LLM，最多重新调用 2 次。第三次结果仍违规时返回 `needs_review=True`，保留可解析的分数、关键词、覆盖率和违规原因，交给人工复核。API 连接或响应信封连续失败时仍抛出运行错误。
+评测链路固定为：
+
+1. 模型 A 首次评分，Python 复核。
+2. 失败时把 Python 违规原因交给模型 A，允许纠正一次。
+3. 仍失败时调用模型 B 独立盲审。模型 B 只接收原问题、参考答案和待评答案，不接收模型 A 的输出或违规原因。
+4. 模型 B 仍未通过 Python 复核时返回 `needs_review=True`，交给人工复核。
+
+默认模型 A 为 `deepseek-v4-flash`。模型 B 使用独立的 OpenAI Chat Completions 兼容接口，并且只在模型 A 纠正失败后才读取和检查以下环境变量：
+
+- `EVALFORGE_MODEL_B`：模型 B 的模型名称
+- `EVALFORGE_MODEL_B_API_URL`：完整的 Chat Completions 接口地址
+- `EVALFORGE_MODEL_B_API_KEY`：模型 B 的 API 密钥
+
+模型 B 未配置不会影响模型 A 的正常评分；只有流程实际进入盲审阶段时才会报出缺少的配置。API 连接或响应信封失败属于技术错误，不会被当成评分冲突转交下一模型，也不会直接设置 `needs_review`。
 
 ## 运行条件
 
@@ -31,9 +44,21 @@ Python 会依次检查：
 
 ## 运行
 
+评测全部 9 条测试答案：
+
 ```powershell
 python main.py
+```
+
+执行完整验收，包括三条固定样本各运行 3 次的稳定性检查：
+
+```powershell
 python main.py --acceptance
+```
+
+运行不调用 API 的本地单元测试：
+
+```powershell
 python -m unittest discover -s tests -v
 ```
 
@@ -41,13 +66,15 @@ python -m unittest discover -s tests -v
 
 ## 固定评测配置
 
-- 模型：`deepseek-v4-flash`
+- 模型 A：`deepseek-v4-flash`
+- 模型 B：通过环境变量配置，与模型 A 使用不同模型
 - 温度：`0`
 - Thinking：关闭
 - 最大输出：`500` tokens
 - 输出模式：`json_object`
 - 评分提示词：固定在 `evalforge/evaluator.py` 中
 - Python 复核规则：固定在 `evalforge/reviewer.py` 中
-- LLM 纠正调用：最多 `2` 次（包括首次调用最多 `3` 次）
+- 模型 A 纠正：最多 `1` 次
+- 模型 B 盲审：模型 A 纠正失败后调用 `1` 次
 
 当前版本只在终端展示结果，不实现 RAG 检索本身、报告、双模型或界面。

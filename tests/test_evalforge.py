@@ -9,6 +9,13 @@ from evalforge.evaluator import DeepSeekEvaluator, EvaluationError, validate_res
 from evalforge.reviewer import review_content, review_result
 
 
+MODEL_B_ENV = {
+    "EVALFORGE_MODEL_B": "independent-model-b",
+    "EVALFORGE_MODEL_B_API_URL": "https://model-b.example/v1/chat/completions",
+    "EVALFORGE_MODEL_B_API_KEY": "model-b-key",
+}
+
+
 def api_response(result: object) -> dict:
     content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
     return {"choices": [{"message": {"content": content}}]}
@@ -174,12 +181,102 @@ class EvaluatorTests(unittest.TestCase):
         self.assertIn("Python 复核", retry_prompt)
         self.assertIn("评分冲突", retry_prompt)
 
-    def test_marks_needs_review_after_two_retries(self) -> None:
-        calls = 0
+    def test_uses_model_b_result_when_blind_review_passes(self) -> None:
+        responses = [
+            {
+                "score": 5,
+                "reason": "模型 A 首次虚高。",
+                "keywords": ["原子性", "一致性"],
+            },
+            {
+                "score": 5,
+                "reason": "模型 A 纠正后仍然虚高。",
+                "keywords": ["原子性", "一致性"],
+            },
+            {
+                "score": 3,
+                "reason": "模型 B 判断只覆盖一半。",
+                "keywords": ["原子性", "一致性"],
+            },
+        ]
+        requests = []
 
         def fake_post(url, headers, body, timeout):
-            nonlocal calls
-            calls += 1
+            requests.append((url, headers, json.loads(body)))
+            return api_response(responses.pop(0))
+
+        environment = {"DEEPSEEK_API_KEY": "test-key", **MODEL_B_ENV}
+        with patch.dict(os.environ, environment, clear=True):
+            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
+                "ACID 是什么？", "原子性和一致性", "只提到原子性"
+            )
+
+        self.assertEqual(result.score, 3)
+        self.assertFalse(result.needs_review)
+        self.assertEqual(result.stage, "model_b_blind")
+        self.assertEqual(result.model, "independent-model-b")
+        self.assertEqual(result.attempts, 3)
+        self.assertEqual(
+            [attempt.stage for attempt in result.review_history],
+            ["model_a_initial", "model_a_correction", "model_b_blind"],
+        )
+        self.assertEqual(
+            requests[2][0], "https://model-b.example/v1/chat/completions"
+        )
+        self.assertEqual(requests[2][1]["Authorization"], "Bearer model-b-key")
+        model_b_body = requests[2][2]
+        self.assertEqual(model_b_body["model"], "independent-model-b")
+        self.assertNotIn("thinking", model_b_body)
+        blind_prompt = model_b_body["messages"][1]["content"]
+        self.assertNotIn("Python 复核", blind_prompt)
+        self.assertNotIn("上一次输出", blind_prompt)
+        self.assertNotIn("模型 A", blind_prompt)
+
+    def test_marks_needs_review_only_after_model_b_also_fails(self) -> None:
+        requests = []
+
+        def fake_post(url, headers, body, timeout):
+            requests.append((url, json.loads(body)))
+            return api_response(
+                {
+                    "score": 5,
+                    "reason": "持续给出虚高分。",
+                    "keywords": ["原子性", "一致性"],
+                }
+            )
+
+        environment = {"DEEPSEEK_API_KEY": "test-key", **MODEL_B_ENV}
+        with patch.dict(os.environ, environment, clear=True):
+            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
+                "ACID 是什么？", "原子性和一致性", "只提到原子性"
+            )
+
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(
+            [request[1]["model"] for request in requests],
+            ["deepseek-v4-flash", "deepseek-v4-flash", "independent-model-b"],
+        )
+        self.assertEqual(result.attempts, 3)
+        self.assertTrue(result.needs_review)
+        self.assertEqual(result.stage, "model_b_blind")
+        self.assertTrue(any("评分冲突" in issue for issue in result.review_issues))
+
+    def test_malformed_output_is_handed_to_human_after_model_b_fails(self) -> None:
+        def fake_post(url, headers, body, timeout):
+            return api_response("not json")
+
+        environment = {"DEEPSEEK_API_KEY": "test-key", **MODEL_B_ENV}
+        with patch.dict(os.environ, environment, clear=True):
+            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
+                "问题", "参考答案", "待评答案"
+            )
+
+        self.assertIsNone(result.score)
+        self.assertTrue(result.needs_review)
+        self.assertEqual(result.attempts, 3)
+
+    def test_model_b_configuration_is_required_only_when_blind_review_runs(self) -> None:
+        def fake_post(url, headers, body, timeout):
             return api_response(
                 {
                     "score": 5,
@@ -189,26 +286,11 @@ class EvaluatorTests(unittest.TestCase):
             )
 
         with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
-            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
-                "ACID 是什么？", "原子性和一致性", "只提到原子性"
-            )
-
-        self.assertEqual(calls, 3)
-        self.assertEqual(result.attempts, 3)
-        self.assertTrue(result.needs_review)
-
-    def test_malformed_output_is_handed_to_human_after_two_retries(self) -> None:
-        def fake_post(url, headers, body, timeout):
-            return api_response("not json")
-
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
-            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
-                "问题", "参考答案", "待评答案"
-            )
-
-        self.assertIsNone(result.score)
-        self.assertTrue(result.needs_review)
-        self.assertEqual(result.attempts, 3)
+            evaluator = DeepSeekEvaluator(http_post=fake_post)
+            with self.assertRaisesRegex(EvaluationError, "模型 B 尚未配置"):
+                evaluator.evaluate(
+                    "ACID 是什么？", "原子性和一致性", "只提到原子性"
+                )
 
 
 class TestDataTests(unittest.TestCase):
