@@ -1,76 +1,95 @@
-# EvalForge v1.3
+# EvalForge v2
 
-EvalForge v1.3 使用“参考答案原子化 + LLM 语义判断 + Python 硬校验 + 选择性双模型盲审”评测短文本问答。
+EvalForge v2 通过 Python 接口调用真实 RAG 系统，将 RAG 生成的回答交给 v1.3 的语义评分和双模型复核流程。测试数据只保存三个问题及参考答案，不再预置待评答案。
 
-## v1.3 变化
+当前默认接入：
 
-- 参考答案按问题拆成 `core` 和 `supporting` 原子知识点，并在同一轮运行中缓存复用。
-- 模型必须逐个知识点输出 `matched`、`partial`、`missing` 或 `contradicted`。
-- 除 `missing` 外，每个状态必须引用待评答案中的真实原文证据。
-- Python 只验证 JSON、字段、证据、知识点 ID、分数状态冲突和不确定性。
-- 待评答案自身存在矛盾时，模型单独输出 `candidate_self_contradiction=true`；Python 强制要求同时设置 `uncertain=true` 并进入复核链路。
-- 原“关键词覆盖率”改为 `lexical_overlap`，只用于诊断，不修改分数、不单独触发人工复核。
-- 新增按知识点状态加权计算的 `semantic_coverage`，同样不直接生成分数。
-- 每次模型调用保存模型、阶段、耗时、Token、原始输出、失败原因和 warning。
-- 默认保存结构化结果到 `results/evaluation_results.json`。
+- RAG 项目：`E:\Enterprise AI Helpdesk`
+- Python 入口：`utils.answer:answer_user`
+- GitHub 项目：`haiku-1350/AI-Helpdesk-Assistant`
 
-完整实现规则见 [docs/judging_rules_v1.3.md](docs/judging_rules_v1.3.md)。
-
-## 双模型流程
+## 流程
 
 ```text
-模型 A 首次评分
-    ↓ Python 硬校验失败或模型不确定
-模型 A 根据明确违规原因纠正一次
-    ↓ 仍失败或不确定
-模型 B 独立盲审
-    ↓ 仍失败、明确不确定或与 A 重大分歧
-人工复核
+问题 + 参考答案
+    ↓ Python 接口
+RAG Router → 检索 → 回答生成
+    ↓ 实时回答
+参考答案原子化 → 模型 A 评分 → Python 硬校验
+    ↓ 失败或不确定
+模型 A 纠正一次 → 模型 B 盲审 → 人工复核
 ```
 
-模型 B 只看到问题、参考答案、缓存的原子知识点和待评答案，不会看到模型 A 的分数、理由或状态。
+EvalForge 不复制或修改 RAG 项目代码。`PythonRagAdapter` 在 RAG 项目目录下调用指定函数，因此 Demo 中基于相对路径读取 `data/*.txt` 的逻辑可以正常工作。
 
-## 环境变量
+## 三个测试问题
 
-- `DEEPSEEK_API_KEY`：模型 A 密钥
-- `GLM_API_KEY`：模型 B 密钥
+默认数据位于 `data/test_cases.json`：
 
-默认模型 A 为 `deepseek-v4-flash`，模型 B 为 `glm-5.1`，模型 B 默认接口为 `https://open.bigmodel.cn/api/paas/v4/chat/completions`。
+1. 员工请假申请流程
+2. VPN 无法连接的处理方式
+3. 报销所需材料
 
-可选覆盖项：
+每条数据严格包含：
 
-- `EVALFORGE_MODEL_A`
-- `EVALFORGE_MODEL_B`
-- `EVALFORGE_MODEL_B_API_URL`
-- `EVALFORGE_MODEL_B_API_KEY`
+```json
+{
+  "question_id": "Q001",
+  "question": "员工请假需要怎么申请？",
+  "reference_answer": "员工需要提前 3 天在系统提交请假申请，主管审批后生效。"
+}
+```
+
+`answers` 等离线待评答案字段会被拒绝。
+
+## 环境准备
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+环境变量：
+
+- `DEEPSEEK_API_KEY`：RAG Router、RAG 回答生成和 EvalForge 模型 A 共用
+- `GLM_API_KEY`：EvalForge 模型 B，在 A 纠正仍未通过时使用
 
 ## 运行
 
 ```powershell
-python main.py
-python main.py --acceptance
-python main.py --data data/test_cases.json --output results/custom.json
-python -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe main.py
 ```
 
-## Python 硬校验
+指定其他本地 RAG 项目或入口：
 
-- 输出必须是严格 JSON，字段和类型正确。
-- 分数必须是 0～5 的整数。
-- 知识点 ID 必须完整对应、无重复、无新增。
-- `matched`、`partial`、`contradicted` 的 evidence 必须是待评答案中的原文。
-- `missing` 的 evidence 必须为 `null`。
-- 5 分不能存在非 `matched` 知识点。
-- 4 分不能存在 `missing` 或 `contradicted` 的核心点。
-- 4～5 分不能存在 major 级错误陈述。
-- `uncertain=true` 必须提供原因，并进入后续复核。
-- `candidate_self_contradiction=true` 时 `uncertain` 不能为 false。
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --rag-project "E:\other-rag" `
+  --rag-entrypoint "package.api:answer" `
+  --min-score 4
+```
 
-## 退出码
+也可以使用：
 
-- `0`：所有基础答案均得到可接受的自动结果
-- `1`：至少一条结果需要人工复核，或离线验收失败
-- `2`：配置、API、文件或其他系统错误
+- `EVALFORGE_RAG_PROJECT`
+- `EVALFORGE_RAG_ENTRYPOINT`
+
+RAG 入口函数必须接收一个问题字符串并返回非空回答字符串。
+
+## 输出和退出码
+
+默认结果保存在 `results/rag_evaluation_results.json`，其中包括：
+
+- 问题、参考答案和实时 RAG 回答
+- RAG 项目、Python 入口和调用耗时
+- 最终分数、理由、语义覆盖和词面重合
+- 每次模型调用的模型、阶段、耗时、Token、原始输出及校验问题
+
+退出码：
+
+- `0`：三个回答均无需人工复核，且达到最低分
+- `1`：存在低于最低分或需要人工复核的回答
+- `2`：RAG 接口、配置、API 或文件错误
 - `130`：用户取消运行
 
-`answer_type` 只在评分完成后用于离线验收，不会发送给任何评分模型。
+v1.3 的评分细则仍见 `docs/judging_rules_v1.3.md`，v2 接入约定见 `docs/rag_integration_v2.md`。

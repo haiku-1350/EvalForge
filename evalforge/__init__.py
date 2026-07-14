@@ -1,4 +1,4 @@
-"""EvalForge v1.3: atomic semantic evaluation with deterministic review."""
+"""EvalForge v2: evaluate live answers from a Python-connected RAG system."""
 
 from .evaluator import (
     DeepSeekEvaluator,
@@ -16,6 +16,7 @@ from .reviewer import (
     review_content,
     review_result,
 )
+from .rag import PythonRagAdapter, RagAnswer, RagIntegrationError
 
 __all__ = [
     "DeepSeekEvaluator",
@@ -30,4 +31,7 @@ __all__ = [
     "ReviewReport",
     "review_content",
     "review_result",
+    "PythonRagAdapter",
+    "RagAnswer",
+    "RagIntegrationError",
 ]

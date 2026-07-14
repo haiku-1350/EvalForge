@@ -1,0 +1,3 @@
+# Versions observed in the connected AI-Helpdesk-Assistant demo environment.
+openai==2.41.1
+rapidfuzz==3.14.5

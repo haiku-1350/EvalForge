@@ -5,8 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from evalforge.cli import load_test_cases, save_results
+from evalforge.cli import (
+    RagCaseResult,
+    check_rag_acceptance,
+    load_test_cases,
+    save_results,
+)
 from evalforge.evaluator import DeepSeekEvaluator, EvaluationError, EvaluationResult
+from evalforge.rag import PythonRagAdapter, RagAnswer, RagIntegrationError
 from evalforge.reviewer import (
     KeyPoint,
     KeyPointJudgment,
@@ -381,14 +387,29 @@ class EvaluatorTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def test_bundled_data_contains_ambiguous_review_case(self) -> None:
+    def test_bundled_data_contains_exactly_three_rag_questions(self) -> None:
         path = Path(__file__).resolve().parents[1] / "data" / "test_cases.json"
         cases = load_test_cases(path)
-        self.assertGreaterEqual(len(cases), 3)
-        self.assertIn(
-            "ambiguous",
-            {answer["answer_type"] for answer in cases[0]["answers"]},
+        self.assertEqual(len(cases), 3)
+        self.assertEqual(
+            set(cases[0]), {"question_id", "question", "reference_answer"}
         )
+
+    def test_rejects_offline_candidate_answers(self) -> None:
+        cases = [
+            {
+                "question_id": f"Q00{index}",
+                "question": "问题",
+                "reference_answer": "参考答案",
+                "answers": [],
+            }
+            for index in range(1, 4)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cases.json"
+            path.write_text(json.dumps(cases, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(EvaluationError, "多余字段 answers"):
+                load_test_cases(path)
 
     def test_saves_structured_audit_result(self) -> None:
         result = EvaluationResult(
@@ -403,21 +424,71 @@ class CliTests(unittest.TestCase):
             stage="model_b_blind",
             status="accepted_model_b",
         )
-        cases = [
-            {
-                "question_id": QUESTION_ID,
-                "question": QUESTION,
-                "reference_answer": REFERENCE,
-                "answers": [{"answer_type": "partial", "answer": CANDIDATE}],
-            }
-        ]
+        cases = [{
+            "question_id": QUESTION_ID,
+            "question": QUESTION,
+            "reference_answer": REFERENCE,
+        }]
+        case_result = RagCaseResult(
+            rag_answer=RagAnswer(
+                text=CANDIDATE,
+                duration_ms=123,
+                project_root=r"E:\Enterprise AI Helpdesk",
+                entrypoint="utils.answer:answer_user",
+            ),
+            evaluation=result,
+        )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "result.json"
-            save_results(path, cases, {QUESTION_ID: {"partial": result}})
+            save_results(path, cases, {QUESTION_ID: case_result})
             payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload[0]["rag_answer"], CANDIDATE)
+        self.assertEqual(payload[0]["rag_call"]["duration_ms"], 123)
         self.assertEqual(payload[0]["judge_source"], "model_b_blind")
         self.assertEqual(payload[0]["semantic_coverage"], 1.0)
         self.assertEqual(payload[0]["key_point_judgments"][0]["id"], "K1")
+
+    def test_rag_acceptance_uses_score_threshold(self) -> None:
+        cases = [
+            {"question_id": QUESTION_ID, "question": QUESTION, "reference_answer": REFERENCE}
+        ]
+        case_result = RagCaseResult(
+            RagAnswer(CANDIDATE, 1, "demo", "demo:answer"),
+            EvaluationResult(score=3, reason="不完整"),
+        )
+        failures = check_rag_acceptance(cases, {QUESTION_ID: case_result}, 4)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("低于门槛 4 分", failures[0])
+
+
+class RagAdapterTests(unittest.TestCase):
+    def test_calls_configured_python_entrypoint_from_project_directory(self) -> None:
+        module_name = "evalforge_test_rag_api"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / f"{module_name}.py").write_text(
+                "from pathlib import Path\n"
+                "def answer(question):\n"
+                "    return f'{Path.cwd().name}:{question}'\n",
+                encoding="utf-8",
+            )
+            try:
+                adapter = PythonRagAdapter(root, f"{module_name}:answer")
+                result = adapter.answer("测试问题")
+                cache_created = (root / "__pycache__").exists()
+            finally:
+                import sys
+
+                sys.modules.pop(module_name, None)
+        self.assertEqual(result.text, f"{root.name}:测试问题")
+        self.assertEqual(result.entrypoint, f"{module_name}:answer")
+        self.assertFalse(cache_created)
+
+    def test_rejects_empty_rag_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = PythonRagAdapter(Path(directory), "demo:answer", lambda _: "")
+            with self.assertRaisesRegex(RagIntegrationError, "空答案"):
+                adapter.answer("测试问题")
 
 
 if __name__ == "__main__":
