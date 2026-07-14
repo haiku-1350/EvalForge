@@ -83,10 +83,14 @@ def evaluate_all(
                 case["question"], case["reference_answer"], answer["answer"]
             )
             case_results[answer_type] = result
+            score_text = str(result.score) if result.score is not None else "无有效分数"
+            review_text = "，需人工复核" if result.needs_review else ""
             print(
-                f"  {ANSWER_TYPE_LABELS[answer_type]}答案：{result.score} 分。"
-                f"评分理由：{result.reason}"
+                f"  {ANSWER_TYPE_LABELS[answer_type]}答案：{score_text} 分{review_text}。"
+                f"关键词覆盖：{result.coverage_ratio:.0%}。评分理由：{result.reason}"
             )
+            if result.needs_review:
+                print(f"    复核问题：{'；'.join(result.review_issues)}")
         results[question_id] = case_results
     return results
 
@@ -98,6 +102,16 @@ def check_score_acceptance(
     for case in cases:
         question_id = case["question_id"]
         scores = results[question_id]
+        review_types = [
+            answer_type
+            for answer_type, result in scores.items()
+            if result.needs_review or result.score is None
+        ]
+        if review_types:
+            failures.append(
+                f"{question_id} 存在需人工复核的答案：{', '.join(review_types)}"
+            )
+            continue
         if scores["correct"].score < 4:
             failures.append(f"{question_id} 的完全正确答案低于 4 分")
         if scores["incorrect"].score > 1:
@@ -123,10 +137,16 @@ def run_stability_check(
             for item in case["answers"]
             if item["answer_type"] == answer_type
         )
-        scores = [
-            evaluator.evaluate(case["question"], case["reference_answer"], answer).score
+        evaluations = [
+            evaluator.evaluate(case["question"], case["reference_answer"], answer)
             for _ in range(3)
         ]
+        if any(result.needs_review or result.score is None for result in evaluations):
+            failures.append(
+                f"{case['question_id']} 的{ANSWER_TYPE_LABELS[answer_type]}样本需人工复核"
+            )
+            continue
+        scores = [result.score for result in evaluations]
         spread = max(scores) - min(scores)
         print(
             f"  {case['question_id']} / {ANSWER_TYPE_LABELS[answer_type]}："
@@ -140,7 +160,7 @@ def run_stability_check(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="EvalForge V1 LLM 答案评测")
+    parser = argparse.ArgumentParser(description="EvalForge v1.1 LLM + Python 答案评测")
     parser.add_argument(
         "--data", type=Path, default=DEFAULT_DATA_PATH, help="测试数据 JSON 路径"
     )
@@ -157,7 +177,7 @@ def main() -> int:
     try:
         cases = load_test_cases(args.data)
         evaluator = DeepSeekEvaluator()
-        print(f"EvalForge V1 开始评测：模型固定为 {MODEL}，共 {len(cases)} 个问题。")
+        print(f"EvalForge v1.1 开始评测：模型固定为 {MODEL}，共 {len(cases)} 个问题。")
         results = evaluate_all(evaluator, cases)
         failures = check_score_acceptance(cases, results)
         if args.acceptance:
@@ -174,5 +194,5 @@ def main() -> int:
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print("\n验收通过：JSON 格式、分数边界和三类答案排序均符合要求。")
+    print("\n验收通过：Python 复核、分数边界和三类答案排序均符合要求。")
     return 0
