@@ -1,18 +1,32 @@
-"""EvalForge: an LLM evaluation pipeline with deterministic Python review."""
+"""EvalForge v1.3: atomic semantic evaluation with deterministic review."""
 
 from .evaluator import (
     DeepSeekEvaluator,
     EvaluationAttempt,
     EvaluationError,
     EvaluationResult,
+    PreparedReference,
 )
-from .reviewer import ReviewReport, review_content, review_result
+from .reviewer import (
+    ExtraClaim,
+    KeyPoint,
+    KeyPointJudgment,
+    ReferenceAnalysis,
+    ReviewReport,
+    review_content,
+    review_result,
+)
 
 __all__ = [
     "DeepSeekEvaluator",
     "EvaluationAttempt",
     "EvaluationError",
     "EvaluationResult",
+    "PreparedReference",
+    "ExtraClaim",
+    "KeyPoint",
+    "KeyPointJudgment",
+    "ReferenceAnalysis",
     "ReviewReport",
     "review_content",
     "review_result",

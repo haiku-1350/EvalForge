@@ -1,203 +1,292 @@
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from evalforge.cli import load_test_cases
-from evalforge.evaluator import DeepSeekEvaluator, EvaluationError, validate_result
-from evalforge.reviewer import review_content, review_result
+from evalforge.cli import load_test_cases, save_results
+from evalforge.evaluator import DeepSeekEvaluator, EvaluationError, EvaluationResult
+from evalforge.reviewer import (
+    KeyPoint,
+    KeyPointJudgment,
+    find_judge_disagreement,
+    review_reference_content,
+    review_result,
+)
 
 
+QUESTION_ID = "Q001"
+QUESTION = "列表最重要的特性是什么？"
+REFERENCE = "列表创建后可以修改元素；列表通常使用方括号表示。"
+CANDIDATE = "列表可以修改。"
+KEY_POINTS = (
+    KeyPoint("K1", "列表创建后可以修改元素", "core"),
+    KeyPoint("K2", "列表通常使用方括号表示", "supporting"),
+)
 MODEL_B_ENV = {
-    "EVALFORGE_MODEL_B": "independent-model-b",
-    "EVALFORGE_MODEL_B_API_URL": "https://model-b.example/v1/chat/completions",
-    "EVALFORGE_MODEL_B_API_KEY": "model-b-key",
+    "GLM_API_KEY": "glm-key",
 }
 
 
 def api_response(result: object) -> dict:
     content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-    return {"choices": [{"message": {"content": content}}]}
+    return {
+        "choices": [{"message": {"content": content}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+    }
 
 
-class ResultValidationTests(unittest.TestCase):
-    def test_accepts_valid_schema(self) -> None:
-        result = validate_result(
+def reference_payload(*, defect: bool = False) -> dict:
+    return {
+        "question_id": QUESTION_ID,
+        "reference_defect": defect,
+        "reference_defect_reasons": ["参考答案自相矛盾"] if defect else [],
+        "key_points": []
+        if defect
+        else [
             {
-                "score": 4,
-                "reason": "核心内容正确，但遗漏一个细节。",
-                "keywords": ["核心内容"],
+                "id": point.id,
+                "statement": point.statement,
+                "importance": point.importance,
             }
+            for point in KEY_POINTS
+        ],
+    }
+
+
+def judge_payload(
+    *,
+    score: int = 4,
+    core_status: str = "matched",
+    supporting_status: str = "missing",
+    uncertain: bool = False,
+    self_contradiction: bool = False,
+) -> dict:
+    core_evidence = "列表可以修改" if core_status != "missing" else None
+    supporting_evidence = "列表可以修改" if supporting_status != "missing" else None
+    return {
+        "question_id": QUESTION_ID,
+        "key_point_judgments": [
+            {
+                "id": "K1",
+                "status": core_status,
+                "evidence": core_evidence,
+                "explanation": "语义等价" if core_status == "matched" else "判断说明",
+            },
+            {
+                "id": "K2",
+                "status": supporting_status,
+                "evidence": supporting_evidence,
+                "explanation": "没有说明方括号"
+                if supporting_status == "missing"
+                else "判断说明",
+            },
+        ],
+        "extra_claims": [],
+        "candidate_self_contradiction": self_contradiction,
+        "score": score,
+        "reason": "核心事实正确，仅遗漏补充信息。",
+        "uncertain": uncertain,
+        "uncertainty_reasons": ["答案内部立场矛盾"] if uncertain else [],
+    }
+
+
+class ReferenceReviewerTests(unittest.TestCase):
+    def test_accepts_valid_atomic_key_points(self) -> None:
+        report = review_reference_content(
+            json.dumps(reference_payload(), ensure_ascii=False), QUESTION_ID
         )
-        self.assertEqual(result.score, 4)
-        self.assertEqual(result.keywords, ("核心内容",))
+        self.assertTrue(report.passed)
+        self.assertEqual(report.analysis.key_points, KEY_POINTS)
 
-    def test_rejects_boolean_score(self) -> None:
-        with self.assertRaises(EvaluationError):
-            validate_result(
-                {"score": True, "reason": "非法分数", "keywords": ["关键词"]}
-            )
+    def test_requires_at_least_one_core_point(self) -> None:
+        payload = reference_payload()
+        payload["key_points"][0]["importance"] = "supporting"
+        report = review_reference_content(json.dumps(payload), QUESTION_ID)
+        self.assertFalse(report.passed)
+        self.assertTrue(any("至少需要一个 core" in issue for issue in report.issues))
 
-    def test_rejects_out_of_range_score(self) -> None:
-        with self.assertRaises(EvaluationError):
-            validate_result(
-                {"score": 6, "reason": "非法分数", "keywords": ["关键词"]}
-            )
+    def test_reference_defect_requires_reason(self) -> None:
+        payload = reference_payload(defect=True)
+        payload["reference_defect_reasons"] = []
+        report = review_reference_content(json.dumps(payload), QUESTION_ID)
+        self.assertFalse(report.passed)
+        self.assertTrue(any("reference_defect" in issue for issue in report.issues))
 
-    def test_rejects_empty_reason(self) -> None:
-        with self.assertRaises(EvaluationError):
-            validate_result({"score": 3, "reason": "  ", "keywords": ["关键词"]})
 
-    def test_rejects_extra_fields(self) -> None:
-        with self.assertRaises(EvaluationError):
-            validate_result(
+class SemanticReviewerTests(unittest.TestCase):
+    def test_accepts_score_four_with_missing_supporting_point(self) -> None:
+        report = review_result(
+            judge_payload(), QUESTION_ID, REFERENCE, CANDIDATE, KEY_POINTS
+        )
+        self.assertTrue(report.acceptable)
+        self.assertAlmostEqual(report.semantic_coverage, 2 / 3)
+
+    def test_score_five_conflicts_with_missing_point(self) -> None:
+        report = review_result(
+            judge_payload(score=5), QUESTION_ID, REFERENCE, CANDIDATE, KEY_POINTS
+        )
+        self.assertFalse(report.passed)
+        self.assertIn("score_state_conflict", report.issue_codes)
+
+    def test_rejects_evidence_not_found_in_candidate(self) -> None:
+        payload = judge_payload()
+        payload["key_point_judgments"][0]["evidence"] = "不存在的原文"
+        report = review_result(payload, QUESTION_ID, REFERENCE, CANDIDATE, KEY_POINTS)
+        self.assertIn("evidence_not_found", report.issue_codes)
+
+    def test_missing_status_requires_null_evidence(self) -> None:
+        payload = judge_payload()
+        payload["key_point_judgments"][1]["evidence"] = "列表"
+        report = review_result(payload, QUESTION_ID, REFERENCE, CANDIDATE, KEY_POINTS)
+        self.assertIn("schema_invalid", report.issue_codes)
+
+    def test_low_lexical_overlap_is_warning_only(self) -> None:
+        points = (KeyPoint("K1", "列表创建后可以修改元素", "core"),)
+        candidate = "这个序列事后允许变更内容。"
+        payload = {
+            "question_id": QUESTION_ID,
+            "key_point_judgments": [
                 {
-                    "score": 3,
-                    "reason": "理由",
-                    "keywords": ["关键词"],
-                    "extra": 1,
+                    "id": "K1",
+                    "status": "matched",
+                    "evidence": "允许变更内容",
+                    "explanation": "语义等价",
                 }
-            )
+            ],
+            "extra_claims": [],
+            "candidate_self_contradiction": False,
+            "score": 5,
+            "reason": "语义完整。",
+            "uncertain": False,
+            "uncertainty_reasons": [],
+        }
+        report = review_result(payload, QUESTION_ID, REFERENCE, candidate, points)
+        self.assertTrue(report.acceptable)
+        self.assertLess(report.lexical_overlap, 0.5)
+        self.assertEqual(report.warnings, ("lexical_semantic_mismatch",))
 
-
-class PythonReviewerTests(unittest.TestCase):
-    def test_accepts_matching_score_and_keyword_coverage(self) -> None:
+    def test_uncertain_result_is_valid_but_not_acceptable(self) -> None:
         report = review_result(
-            {
-                "score": 4,
-                "reason": "覆盖主要内容。",
-                "keywords": ["404", "资源找不到", "500", "内部错误"],
-            },
-            "404 表示资源找不到，500 表示服务器内部错误。",
-            "404 是资源找不到；500 是内部错误。",
+            judge_payload(uncertain=True),
+            QUESTION_ID,
+            REFERENCE,
+            CANDIDATE,
+            KEY_POINTS,
         )
         self.assertTrue(report.passed)
-        self.assertEqual(report.coverage_ratio, 1.0)
+        self.assertFalse(report.acceptable)
 
-    def test_rejects_keyword_not_extracted_from_reference(self) -> None:
+    def test_self_contradiction_requires_uncertainty(self) -> None:
         report = review_result(
-            {"score": 1, "reason": "错误。", "keywords": ["不存在的词"]},
-            "参考答案",
-            "待评答案",
+            judge_payload(self_contradiction=True),
+            QUESTION_ID,
+            REFERENCE,
+            CANDIDATE,
+            KEY_POINTS,
         )
-        self.assertFalse(report.passed)
-        self.assertIn("不在参考答案", report.issues[-1])
+        self.assertIn("self_contradiction_conflict", report.issue_codes)
 
-    def test_flags_high_score_with_low_coverage(self) -> None:
+    def test_self_contradiction_with_uncertainty_goes_to_review(self) -> None:
         report = review_result(
-            {
-                "score": 5,
-                "reason": "声称完整。",
-                "keywords": ["原子性", "一致性", "隔离性", "持久性"],
-            },
-            "原子性、一致性、隔离性、持久性",
-            "只说明了原子性和持久性",
-        )
-        self.assertFalse(report.passed)
-        self.assertEqual(report.coverage_ratio, 0.5)
-        self.assertTrue(any(issue.startswith("评分冲突：") for issue in report.issues))
-
-    def test_low_score_is_allowed_even_when_keywords_are_repeated(self) -> None:
-        report = review_result(
-            {"score": 0, "reason": "结论与参考答案相反。", "keywords": ["可变"]},
-            "列表可变",
-            "列表不是可变的",
+            judge_payload(uncertain=True, self_contradiction=True),
+            QUESTION_ID,
+            REFERENCE,
+            CANDIDATE,
+            KEY_POINTS,
         )
         self.assertTrue(report.passed)
+        self.assertFalse(report.acceptable)
+        self.assertTrue(report.candidate_self_contradiction)
 
-    def test_rejects_non_json_content(self) -> None:
-        report = review_content("not json", "参考答案", "待评答案")
-        self.assertFalse(report.passed)
-        self.assertIsNone(report.score)
-        self.assertIn("不是合法 JSON", report.issues[0])
-
-    def test_rejects_punctuation_only_keyword(self) -> None:
-        report = review_result(
-            {"score": 1, "reason": "无关。", "keywords": ["..."]},
-            "参考答案",
-            "待评答案",
+    def test_detects_large_judge_score_disagreement(self) -> None:
+        model_a = review_result(
+            judge_payload(score=4, uncertain=True),
+            QUESTION_ID,
+            REFERENCE,
+            CANDIDATE,
+            KEY_POINTS,
         )
-        self.assertFalse(report.passed)
-        self.assertTrue(any("只包含空白或标点" in issue for issue in report.issues))
+        model_b = review_result(
+            judge_payload(score=2),
+            QUESTION_ID,
+            REFERENCE,
+            CANDIDATE,
+            KEY_POINTS,
+        )
+        reasons = find_judge_disagreement(model_a, model_b, KEY_POINTS)
+        self.assertTrue(any("相差 2 分" in reason for reason in reasons))
 
 
 class EvaluatorTests(unittest.TestCase):
-    def test_requires_environment_variable(self) -> None:
+    def test_requires_model_a_environment_variable(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(EvaluationError, "DEEPSEEK_API_KEY"):
                 DeepSeekEvaluator()
 
-    def test_parses_and_reviews_nested_api_response(self) -> None:
+    def test_accepts_model_a_initial_result_and_records_audit_data(self) -> None:
+        responses = [reference_payload(), judge_payload()]
+
         def fake_post(url, headers, body, timeout):
-            request_body = json.loads(body)
-            self.assertEqual(request_body["model"], "deepseek-v4-flash")
-            self.assertEqual(request_body["temperature"], 0)
-            self.assertEqual(request_body["response_format"], {"type": "json_object"})
-            self.assertNotIn("test-key", body.decode("utf-8"))
-            return api_response(
-                {
-                    "score": 5,
-                    "reason": "语义一致且内容完整。",
-                    "keywords": ["参考答案"],
-                }
+            return api_response(responses.pop(0))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "a-key"}, clear=True):
+            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
+                QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID
             )
 
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
-            evaluator = DeepSeekEvaluator(http_post=fake_post)
-            result = evaluator.evaluate("问题", "参考答案", "参考答案")
-        self.assertEqual(result.score, 5)
-        self.assertFalse(result.needs_review)
-        self.assertEqual(result.attempts, 1)
+        self.assertEqual(result.status, "accepted_model_a")
+        self.assertEqual(result.score, 4)
+        self.assertEqual(result.review_history[0].token_usage["total_tokens"], 30)
+        self.assertTrue(result.review_history[0].raw_result)
+        self.assertEqual(len(result.reference_history), 1)
 
-    def test_retries_with_python_feedback_then_accepts_correction(self) -> None:
-        responses = [
-            {
-                "score": 5,
-                "reason": "错误地判为完整。",
-                "keywords": ["原子性", "一致性"],
-            },
-            {
-                "score": 3,
-                "reason": "只覆盖了一半关键词。",
-                "keywords": ["原子性", "一致性"],
-            },
-        ]
+    def test_reference_atomization_is_cached_for_all_answers(self) -> None:
+        responses = [reference_payload(), judge_payload(), judge_payload()]
         request_bodies = []
 
         def fake_post(url, headers, body, timeout):
             request_bodies.append(json.loads(body))
             return api_response(responses.pop(0))
 
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "a-key"}, clear=True):
+            evaluator = DeepSeekEvaluator(http_post=fake_post)
+            evaluator.evaluate(QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID)
+            evaluator.evaluate(QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID)
+
+        atomization_calls = [
+            body
+            for body in request_bodies
+            if "请原子化" in body["messages"][1]["content"]
+        ]
+        self.assertEqual(len(atomization_calls), 1)
+
+    def test_model_a_receives_hard_failure_and_corrects_once(self) -> None:
+        responses = [reference_payload(), judge_payload(score=5), judge_payload(score=4)]
+        request_bodies = []
+
+        def fake_post(url, headers, body, timeout):
+            request_bodies.append(json.loads(body))
+            return api_response(responses.pop(0))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "a-key"}, clear=True):
             result = DeepSeekEvaluator(http_post=fake_post).evaluate(
-                "ACID 是什么？", "原子性和一致性", "只提到原子性"
+                QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID
             )
 
-        self.assertEqual(result.score, 3)
+        self.assertEqual(result.status, "accepted_model_a_retry")
         self.assertEqual(result.attempts, 2)
-        self.assertFalse(result.needs_review)
-        retry_prompt = request_bodies[1]["messages"][1]["content"]
-        self.assertIn("Python 复核", retry_prompt)
-        self.assertIn("评分冲突", retry_prompt)
+        correction_prompt = request_bodies[2]["messages"][1]["content"]
+        self.assertIn("score_state_conflict", correction_prompt)
+        self.assertNotIn("词面", correction_prompt)
 
-    def test_uses_model_b_result_when_blind_review_passes(self) -> None:
+    def test_model_b_blind_result_is_accepted(self) -> None:
         responses = [
-            {
-                "score": 5,
-                "reason": "模型 A 首次虚高。",
-                "keywords": ["原子性", "一致性"],
-            },
-            {
-                "score": 5,
-                "reason": "模型 A 纠正后仍然虚高。",
-                "keywords": ["原子性", "一致性"],
-            },
-            {
-                "score": 3,
-                "reason": "模型 B 判断只覆盖一半。",
-                "keywords": ["原子性", "一致性"],
-            },
+            reference_payload(),
+            judge_payload(score=5),
+            judge_payload(score=5),
+            judge_payload(score=4),
         ]
         requests = []
 
@@ -205,147 +294,130 @@ class EvaluatorTests(unittest.TestCase):
             requests.append((url, headers, json.loads(body)))
             return api_response(responses.pop(0))
 
-        environment = {"DEEPSEEK_API_KEY": "test-key", **MODEL_B_ENV}
+        environment = {"DEEPSEEK_API_KEY": "a-key", **MODEL_B_ENV}
         with patch.dict(os.environ, environment, clear=True):
             result = DeepSeekEvaluator(http_post=fake_post).evaluate(
-                "ACID 是什么？", "原子性和一致性", "只提到原子性"
+                QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID
             )
 
-        self.assertEqual(result.score, 3)
-        self.assertFalse(result.needs_review)
-        self.assertEqual(result.stage, "model_b_blind")
-        self.assertEqual(result.model, "independent-model-b")
-        self.assertEqual(result.attempts, 3)
-        self.assertEqual(
-            [attempt.stage for attempt in result.review_history],
-            ["model_a_initial", "model_a_correction", "model_b_blind"],
-        )
-        self.assertEqual(
-            requests[2][0], "https://model-b.example/v1/chat/completions"
-        )
-        self.assertEqual(requests[2][1]["Authorization"], "Bearer model-b-key")
-        model_b_body = requests[2][2]
-        self.assertEqual(model_b_body["model"], "independent-model-b")
-        self.assertEqual(model_b_body["thinking"], {"type": "disabled"})
-        blind_prompt = model_b_body["messages"][1]["content"]
-        self.assertNotIn("Python 复核", blind_prompt)
-        self.assertNotIn("上一次输出", blind_prompt)
-        self.assertNotIn("模型 A", blind_prompt)
-
-    def test_glm_api_key_enables_default_model_b(self) -> None:
-        responses = [
-            {
-                "score": 5,
-                "reason": "模型 A 首次虚高。",
-                "keywords": ["原子性", "一致性"],
-            },
-            {
-                "score": 5,
-                "reason": "模型 A 纠正后仍然虚高。",
-                "keywords": ["原子性", "一致性"],
-            },
-            {
-                "score": 3,
-                "reason": "GLM 独立判断只覆盖一半。",
-                "keywords": ["原子性", "一致性"],
-            },
-        ]
-        requests = []
-
-        def fake_post(url, headers, body, timeout):
-            requests.append((url, headers, json.loads(body)))
-            return api_response(responses.pop(0))
-
-        environment = {
-            "DEEPSEEK_API_KEY": "deepseek-key",
-            "GLM_API_KEY": "glm-key",
-        }
-        with patch.dict(os.environ, environment, clear=True):
-            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
-                "ACID 是什么？", "原子性和一致性", "只提到原子性"
-            )
-
+        self.assertEqual(result.status, "accepted_model_b")
         self.assertFalse(result.needs_review)
         self.assertEqual(result.model, "glm-5.1")
         self.assertEqual(
-            requests[2][0],
+            requests[3][0],
             "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         )
-        self.assertEqual(requests[2][1]["Authorization"], "Bearer glm-key")
-        self.assertEqual(requests[2][2]["model"], "glm-5.1")
-        self.assertEqual(requests[2][2]["thinking"], {"type": "disabled"})
+        blind_prompt = requests[3][2]["messages"][1]["content"]
+        self.assertNotIn("上一次", blind_prompt)
+        self.assertNotIn("模型 A", blind_prompt)
+        self.assertNotIn("partial", blind_prompt)
 
-    def test_marks_needs_review_only_after_model_b_also_fails(self) -> None:
-        requests = []
+    def test_model_b_uncertainty_requires_human_review(self) -> None:
+        responses = [
+            reference_payload(),
+            judge_payload(score=5),
+            judge_payload(score=5),
+            judge_payload(score=4, uncertain=True),
+        ]
 
         def fake_post(url, headers, body, timeout):
-            requests.append((url, json.loads(body)))
-            return api_response(
-                {
-                    "score": 5,
-                    "reason": "持续给出虚高分。",
-                    "keywords": ["原子性", "一致性"],
-                }
-            )
+            return api_response(responses.pop(0))
 
-        environment = {"DEEPSEEK_API_KEY": "test-key", **MODEL_B_ENV}
+        environment = {"DEEPSEEK_API_KEY": "a-key", **MODEL_B_ENV}
         with patch.dict(os.environ, environment, clear=True):
             result = DeepSeekEvaluator(http_post=fake_post).evaluate(
-                "ACID 是什么？", "原子性和一致性", "只提到原子性"
+                QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID
             )
 
-        self.assertEqual(len(requests), 3)
-        self.assertEqual(
-            [request[1]["model"] for request in requests],
-            ["deepseek-v4-flash", "deepseek-v4-flash", "independent-model-b"],
-        )
-        self.assertEqual(result.attempts, 3)
         self.assertTrue(result.needs_review)
-        self.assertEqual(result.stage, "model_b_blind")
-        self.assertTrue(any("评分冲突" in issue for issue in result.review_issues))
+        self.assertEqual(result.status, "needs_human_review")
+        self.assertTrue(any("judge_uncertain" in issue for issue in result.review_issues))
 
-    def test_malformed_output_is_handed_to_human_after_model_b_fails(self) -> None:
+    def test_valid_b_result_with_large_disagreement_requires_review(self) -> None:
+        responses = [
+            reference_payload(),
+            judge_payload(score=4, uncertain=True),
+            judge_payload(score=4, uncertain=True),
+            judge_payload(score=2),
+        ]
+
         def fake_post(url, headers, body, timeout):
-            return api_response("not json")
+            return api_response(responses.pop(0))
 
-        environment = {"DEEPSEEK_API_KEY": "test-key", **MODEL_B_ENV}
+        environment = {"DEEPSEEK_API_KEY": "a-key", **MODEL_B_ENV}
         with patch.dict(os.environ, environment, clear=True):
             result = DeepSeekEvaluator(http_post=fake_post).evaluate(
-                "问题", "参考答案", "待评答案"
+                QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID
             )
 
-        self.assertIsNone(result.score)
         self.assertTrue(result.needs_review)
-        self.assertEqual(result.attempts, 3)
+        self.assertTrue(any("judge_disagreement" in issue for issue in result.review_issues))
 
-    def test_model_b_configuration_is_required_only_when_blind_review_runs(self) -> None:
+    def test_reference_defect_goes_directly_to_human(self) -> None:
         def fake_post(url, headers, body, timeout):
-            return api_response(
-                {
-                    "score": 5,
-                    "reason": "持续给出虚高分。",
-                    "keywords": ["原子性", "一致性"],
-                }
+            return api_response(reference_payload(defect=True))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "a-key"}, clear=True):
+            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
+                QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID
             )
 
-        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-key"}, clear=True):
+        self.assertTrue(result.needs_review)
+        self.assertEqual(result.status, "reference_defect")
+        self.assertEqual(result.attempts, 0)
+
+    def test_model_b_key_is_required_only_when_blind_review_runs(self) -> None:
+        responses = [reference_payload(), judge_payload(score=5), judge_payload(score=5)]
+
+        def fake_post(url, headers, body, timeout):
+            return api_response(responses.pop(0))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "a-key"}, clear=True):
             evaluator = DeepSeekEvaluator(http_post=fake_post)
-            with self.assertRaisesRegex(EvaluationError, "模型 B 尚未配置"):
+            with self.assertRaisesRegex(EvaluationError, "GLM_API_KEY"):
                 evaluator.evaluate(
-                    "ACID 是什么？", "原子性和一致性", "只提到原子性"
+                    QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID
                 )
 
 
-class TestDataTests(unittest.TestCase):
-    def test_bundled_data_has_required_shape(self) -> None:
+class CliTests(unittest.TestCase):
+    def test_bundled_data_contains_ambiguous_review_case(self) -> None:
         path = Path(__file__).resolve().parents[1] / "data" / "test_cases.json"
         cases = load_test_cases(path)
         self.assertGreaterEqual(len(cases), 3)
-        for case in cases:
-            self.assertEqual(
-                {answer["answer_type"] for answer in case["answers"]},
-                {"correct", "partial", "incorrect"},
-            )
+        self.assertIn(
+            "ambiguous",
+            {answer["answer_type"] for answer in cases[0]["answers"]},
+        )
+
+    def test_saves_structured_audit_result(self) -> None:
+        result = EvaluationResult(
+            score=4,
+            reason="核心正确。",
+            key_point_judgments=(
+                KeyPointJudgment("K1", "matched", "列表可以修改", "语义等价"),
+            ),
+            semantic_coverage=1.0,
+            lexical_overlap=0.2,
+            model="glm-5.1",
+            stage="model_b_blind",
+            status="accepted_model_b",
+        )
+        cases = [
+            {
+                "question_id": QUESTION_ID,
+                "question": QUESTION,
+                "reference_answer": REFERENCE,
+                "answers": [{"answer_type": "partial", "answer": CANDIDATE}],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            save_results(path, cases, {QUESTION_ID: {"partial": result}})
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload[0]["judge_source"], "model_b_blind")
+        self.assertEqual(payload[0]["semantic_coverage"], 1.0)
+        self.assertEqual(payload[0]["key_point_judgments"][0]["id"], "K1")
 
 
 if __name__ == "__main__":

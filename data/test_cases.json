@@ -15,6 +15,10 @@
       {
         "answer_type": "incorrect",
         "answer": "元组可以随时增删元素，而列表创建后不能改变。"
+      },
+      {
+        "answer_type": "ambiguous",
+        "answer": "列表是可变的，但创建后不能修改元素；元组不可变，不过可以随时增删元素。"
       }
     ]
   },
