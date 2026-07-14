@@ -16,6 +16,7 @@ from .evaluator import (
 from .rag import (
     DEFAULT_RAG_ENTRYPOINT,
     DEFAULT_RAG_PROJECT,
+    HttpRagAdapter,
     PythonRagAdapter,
     RagAnswer,
     RagIntegrationError,
@@ -46,7 +47,7 @@ def load_test_cases(path: Path) -> list[dict[str, str]]:
     except json.JSONDecodeError as exc:
         raise EvaluationError(f"测试数据不是合法 JSON：{path}") from exc
     if not isinstance(data, list) or len(data) != CASE_COUNT:
-        raise EvaluationError(f"v2.1 测试数据必须恰好包含 {CASE_COUNT} 个问题")
+        raise EvaluationError(f"v2.2 测试数据必须恰好包含 {CASE_COUNT} 个问题")
 
     seen_ids: set[str] = set()
     normalized: list[dict[str, str]] = []
@@ -74,7 +75,7 @@ def load_test_cases(path: Path) -> list[dict[str, str]]:
 
 def evaluate_rag(
     evaluator: DeepSeekEvaluator,
-    rag: PythonRagAdapter,
+    rag: PythonRagAdapter | HttpRagAdapter,
     cases: list[dict[str, str]],
     threshold: int = 4,
 ) -> dict[str, RagCaseResult]:
@@ -82,11 +83,11 @@ def evaluate_rag(
     for case in cases:
         question_id = case["question_id"]
         print(f"\n[{question_id}] {case['question']}")
-        rag_answer = rag.answer(case["question"])
+        rag_answer = rag.answer(case["question"], question_id=question_id)
         print(f"  RAG 回答：{rag_answer.text}")
         if not rag_answer.trace_available:
             raise RagIntegrationError(
-                "v2.1 需要 RAG 入口返回检索轨迹，或在入口模块中暴露 route_query 和 retrieve"
+                "v2.2 需要 RAG 返回检索轨迹；HTTP 响应必须包含 retrieved_context"
             )
         print(
             f"  检索：intent={rag_answer.intent}，改写={rag_answer.rewritten_question}，"
@@ -234,6 +235,7 @@ def _serialize_result(
         "rag_call": {
             "project_root": rag_answer.project_root,
             "entrypoint": rag_answer.entrypoint,
+            "transport": rag_answer.transport,
             "duration_ms": rag_answer.duration_ms,
             "intent": rag_answer.intent,
             "rewritten_question": rag_answer.rewritten_question,
@@ -349,8 +351,18 @@ def _serialize_attempt(attempt: Any) -> dict[str, Any]:
     }
 
 
+def _http_timeout(value: str) -> int:
+    try:
+        timeout = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("超时必须是整数") from exc
+    if not 1 <= timeout <= 300:
+        raise argparse.ArgumentTypeError("超时必须在 1 到 300 秒之间")
+    return timeout
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="EvalForge v2.1 RAG 归因评测")
+    parser = argparse.ArgumentParser(description="EvalForge v2.2 RAG 归因评测")
     parser.add_argument(
         "--data", type=Path, default=DEFAULT_DATA_PATH, help="三个问题及参考答案的 JSON 文件"
     )
@@ -359,6 +371,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_OUTPUT_PATH,
         help="结构化评测结果 JSON 路径",
+    )
+    parser.add_argument(
+        "--rag-transport",
+        choices=("python", "http"),
+        default=os.getenv("EVALFORGE_RAG_TRANSPORT", "python"),
+        help="RAG 接入方式，默认 python",
     )
     parser.add_argument(
         "--rag-project",
@@ -372,6 +390,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="RAG Python 入口，格式为 module:function",
     )
     parser.add_argument(
+        "--rag-url",
+        default=os.getenv("EVALFORGE_RAG_URL", ""),
+        help="外部 RAG HTTP 接口地址",
+    )
+    parser.add_argument(
+        "--rag-timeout",
+        type=_http_timeout,
+        default=os.getenv("EVALFORGE_RAG_TIMEOUT", "60"),
+        help="外部 RAG HTTP 超时秒数，默认 60",
+    )
+    parser.add_argument(
+        "--rag-api-key-env",
+        default=os.getenv("EVALFORGE_RAG_API_KEY_ENV", "EVALFORGE_RAG_API_KEY"),
+        help="保存外部 RAG Bearer Token 的环境变量名称",
+    )
+    parser.add_argument(
         "--min-score",
         type=int,
         choices=range(0, 6),
@@ -381,14 +415,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_rag_adapter(args: argparse.Namespace) -> PythonRagAdapter | HttpRagAdapter:
+    if args.rag_transport == "http":
+        if not args.rag_url:
+            raise RagIntegrationError(
+                "HTTP 接入需要 --rag-url 或环境变量 EVALFORGE_RAG_URL"
+            )
+        api_key = os.getenv(args.rag_api_key_env, "") if args.rag_api_key_env else ""
+        return HttpRagAdapter(
+            args.rag_url,
+            api_key=api_key,
+            timeout_seconds=args.rag_timeout,
+        )
+    return PythonRagAdapter(args.rag_project, args.rag_entrypoint)
+
+
 def main() -> int:
     args = build_parser().parse_args()
     try:
         cases = load_test_cases(args.data)
-        rag = PythonRagAdapter(args.rag_project, args.rag_entrypoint)
+        rag = build_rag_adapter(args)
         evaluator = DeepSeekEvaluator()
         print(
-            f"EvalForge v2.1 开始评测：RAG={rag.entrypoint}，"
+            f"EvalForge v2.2 开始评测：RAG={rag.entrypoint}，"
             f"模型 A={evaluator.model_a}，模型 B={evaluator.model_b}，"
             f"共 {len(cases)} 个问题。"
         )

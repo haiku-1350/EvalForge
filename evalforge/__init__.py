@@ -1,4 +1,4 @@
-"""EvalForge v2.1: score correctness, groundedness, and RAG error type."""
+"""EvalForge v2.2: evaluate local or HTTP-connected RAG systems."""
 
 from .evaluator import (
     DeepSeekEvaluator,
@@ -18,7 +18,7 @@ from .reviewer import (
     review_content,
     review_result,
 )
-from .rag import PythonRagAdapter, RagAnswer, RagIntegrationError
+from .rag import HttpRagAdapter, PythonRagAdapter, RagAnswer, RagIntegrationError
 
 __all__ = [
     "DeepSeekEvaluator",
@@ -35,6 +35,7 @@ __all__ = [
     "review_content",
     "review_result",
     "PythonRagAdapter",
+    "HttpRagAdapter",
     "RagAnswer",
     "RagIntegrationError",
     "GroundingClaim",

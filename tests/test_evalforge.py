@@ -1,12 +1,16 @@
+import argparse
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 from evalforge.cli import (
     RagCaseResult,
+    build_rag_adapter,
     check_rag_acceptance,
     classify_error_type,
     load_test_cases,
@@ -19,7 +23,12 @@ from evalforge.evaluator import (
     GroundednessEvaluationResult,
 )
 from evalforge.grounding import GroundingClaim, review_grounding_result
-from evalforge.rag import PythonRagAdapter, RagAnswer, RagIntegrationError
+from evalforge.rag import (
+    HttpRagAdapter,
+    PythonRagAdapter,
+    RagAnswer,
+    RagIntegrationError,
+)
 from evalforge.reviewer import (
     KeyPoint,
     KeyPointJudgment,
@@ -588,6 +597,7 @@ class CliTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(payload[0]["rag_answer"], CANDIDATE)
         self.assertEqual(payload[0]["rag_call"]["duration_ms"], 123)
+        self.assertEqual(payload[0]["rag_call"]["transport"], "python")
         self.assertEqual(payload[0]["correctness_score"], 4)
         self.assertEqual(payload[0]["groundedness_score"], 5)
         self.assertEqual(payload[0]["error_type"], "none")
@@ -620,6 +630,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual(classify_error_type(bad, bad, grounded, 4), "retrieval")
         self.assertEqual(classify_error_type(bad, good, grounded, 4), "generation")
         self.assertEqual(classify_error_type(bad, bad, ungrounded, 4), "both")
+
+    def test_http_transport_requires_url(self) -> None:
+        args = argparse.Namespace(
+            rag_transport="http",
+            rag_url="",
+            rag_api_key_env="EVALFORGE_RAG_API_KEY",
+            rag_timeout=60,
+        )
+        with self.assertRaisesRegex(RagIntegrationError, "--rag-url"):
+            build_rag_adapter(args)
 
 
 class RagAdapterTests(unittest.TestCase):
@@ -661,6 +681,101 @@ class RagAdapterTests(unittest.TestCase):
             adapter = PythonRagAdapter(Path(directory), "demo:answer", lambda _: "")
             with self.assertRaisesRegex(RagIntegrationError, "空答案"):
                 adapter.answer("测试问题")
+
+
+class HttpRagAdapterTests(unittest.TestCase):
+    def test_posts_question_and_reads_strict_trace_response(self) -> None:
+        requests = []
+
+        def fake_post(url, headers, body, timeout):
+            requests.append((url, headers, json.loads(body), timeout))
+            return {
+                "answer": "请重启 VPN 客户端。",
+                "retrieved_context": "VPN问题：无法连接VPN请重启客户端或检查账号",
+                "intent": "IT",
+                "rewritten_question": "VPN 无法连接怎么办",
+                "need_human": False,
+            }
+
+        adapter = HttpRagAdapter(
+            "https://rag.example.com/evaluate",
+            api_key="secret-token",
+            timeout_seconds=25,
+            http_post=fake_post,
+        )
+        result = adapter.answer("VPN 无法连接怎么办？", question_id="Q002")
+
+        self.assertEqual(requests[0][2]["question_id"], "Q002")
+        self.assertEqual(requests[0][2]["question"], "VPN 无法连接怎么办？")
+        self.assertEqual(requests[0][1]["Authorization"], "Bearer secret-token")
+        self.assertEqual(requests[0][3], 25)
+        self.assertEqual(result.transport, "http")
+        self.assertEqual(result.intent, "IT")
+        self.assertTrue(result.trace_available)
+
+    def test_rejects_missing_retrieved_context(self) -> None:
+        adapter = HttpRagAdapter(
+            "https://rag.example.com/evaluate",
+            http_post=lambda *args: {"answer": "回答"},
+        )
+        with self.assertRaisesRegex(RagIntegrationError, "retrieved_context"):
+            adapter.answer("问题")
+
+    def test_rejects_unknown_response_fields(self) -> None:
+        adapter = HttpRagAdapter(
+            "https://rag.example.com/evaluate",
+            http_post=lambda *args: {
+                "answer": "回答",
+                "retrieved_context": "资料",
+                "debug": "不应进入正式契约",
+            },
+        )
+        with self.assertRaisesRegex(RagIntegrationError, "未知字段"):
+            adapter.answer("问题")
+
+    def test_real_local_http_round_trip(self) -> None:
+        received: dict = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers["Content-Length"])
+                received.update(json.loads(self.rfile.read(length)))
+                payload = json.dumps(
+                    {
+                        "answer": "提交发票和审批单。",
+                        "retrieved_context": "报销流程：提交发票+审批单",
+                        "intent": "FINANCE",
+                        "rewritten_question": "报销材料",
+                        "need_human": False,
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            adapter = HttpRagAdapter(
+                f"http://127.0.0.1:{server.server_port}/rag",
+                timeout_seconds=5,
+            )
+            result = adapter.answer("报销需要什么材料？", question_id="Q003")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(received["question_id"], "Q003")
+        self.assertEqual(result.text, "提交发票和审批单。")
+        self.assertEqual(result.retrieved_context, "报销流程：提交发票+审批单")
 
 
 if __name__ == "__main__":
