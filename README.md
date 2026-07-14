@@ -26,11 +26,12 @@ Python 会依次检查：
 3. 仍失败时调用模型 B 独立盲审。模型 B 只接收原问题、参考答案和待评答案，不接收模型 A 的输出或违规原因。
 4. 模型 B 仍未通过 Python 复核时返回 `needs_review=True`，交给人工复核。
 
-默认模型 A 为 `deepseek-v4-flash`。模型 B 使用独立的 OpenAI Chat Completions 兼容接口，并且只在模型 A 纠正失败后才读取和检查以下环境变量：
+默认模型 A 为 `deepseek-v4-flash`，模型 B 为智谱 `glm-5.1`。模型 B 使用智谱通用 Chat Completions 接口 `https://open.bigmodel.cn/api/paas/v4/chat/completions`，并且只在模型 A 纠正失败后才读取和检查凭据。
 
-- `EVALFORGE_MODEL_B`：模型 B 的模型名称
-- `EVALFORGE_MODEL_B_API_URL`：完整的 Chat Completions 接口地址
-- `EVALFORGE_MODEL_B_API_KEY`：模型 B 的 API 密钥
+- `GLM_API_KEY`：模型 B 的默认 API 密钥
+- `EVALFORGE_MODEL_B`：可选，覆盖模型 B 名称
+- `EVALFORGE_MODEL_B_API_URL`：可选，覆盖完整的 Chat Completions 接口地址
+- `EVALFORGE_MODEL_B_API_KEY`：可选，优先于 `GLM_API_KEY` 覆盖模型 B 密钥
 
 模型 B 未配置不会影响模型 A 的正常评分；只有流程实际进入盲审阶段时才会报出缺少的配置。API 连接或响应信封失败属于技术错误，不会被当成评分冲突转交下一模型，也不会直接设置 `needs_review`。
 
@@ -67,7 +68,7 @@ python -m unittest discover -s tests -v
 ## 固定评测配置
 
 - 模型 A：`deepseek-v4-flash`
-- 模型 B：通过环境变量配置，与模型 A 使用不同模型
+- 模型 B：`glm-5.1`，使用独立的 `GLM_API_KEY`
 - 温度：`0`
 - Thinking：关闭
 - 最大输出：`500` tokens

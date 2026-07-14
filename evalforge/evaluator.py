@@ -12,7 +12,8 @@ from .reviewer import ReviewReport, review_content, review_result
 
 API_URL = "https://api.deepseek.com/chat/completions"
 MODEL_A = "deepseek-v4-flash"
-MODEL_B = ""
+MODEL_B = "glm-5.1"
+MODEL_B_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 # Backward-compatible alias for callers that only display the primary model.
 MODEL = MODEL_A
 TEMPERATURE = 0
@@ -110,12 +111,16 @@ class DeepSeekEvaluator:
         self._api_key = api_key
         self._http_post = http_post or _default_http_post
         self.model_a = model_a or os.getenv("EVALFORGE_MODEL_A", MODEL_A)
-        self.model_b = model_b or os.getenv("EVALFORGE_MODEL_B", MODEL_B)
-        self._model_b_api_key = model_b_api_key or os.getenv(
-            "EVALFORGE_MODEL_B_API_KEY", ""
+        self.model_b = model_b or os.getenv("EVALFORGE_MODEL_B") or MODEL_B
+        self._model_b_api_key = (
+            model_b_api_key
+            or os.getenv("EVALFORGE_MODEL_B_API_KEY")
+            or os.getenv("GLM_API_KEY", "")
         )
-        self._model_b_api_url = model_b_api_url or os.getenv(
-            "EVALFORGE_MODEL_B_API_URL", ""
+        self._model_b_api_url = (
+            model_b_api_url
+            or os.getenv("EVALFORGE_MODEL_B_API_URL")
+            or MODEL_B_API_URL
         )
 
     def evaluate(
@@ -186,7 +191,7 @@ class DeepSeekEvaluator:
             user_prompt=base_prompt,
             api_url=self._model_b_api_url,
             api_key=self._model_b_api_key,
-            include_thinking=False,
+            include_thinking=True,
             reference_answer=reference_answer,
             candidate_answer=candidate_answer,
         )
@@ -247,7 +252,7 @@ class DeepSeekEvaluator:
         if not self._model_b_api_url:
             missing.append("EVALFORGE_MODEL_B_API_URL")
         if not self._model_b_api_key:
-            missing.append("EVALFORGE_MODEL_B_API_KEY")
+            missing.append("GLM_API_KEY（或 EVALFORGE_MODEL_B_API_KEY）")
         if missing:
             raise EvaluationError(
                 "模型 A 纠正后仍未通过，但模型 B 尚未配置：" + ", ".join(missing)

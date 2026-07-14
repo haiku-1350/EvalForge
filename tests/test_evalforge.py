@@ -226,11 +226,54 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(requests[2][1]["Authorization"], "Bearer model-b-key")
         model_b_body = requests[2][2]
         self.assertEqual(model_b_body["model"], "independent-model-b")
-        self.assertNotIn("thinking", model_b_body)
+        self.assertEqual(model_b_body["thinking"], {"type": "disabled"})
         blind_prompt = model_b_body["messages"][1]["content"]
         self.assertNotIn("Python 复核", blind_prompt)
         self.assertNotIn("上一次输出", blind_prompt)
         self.assertNotIn("模型 A", blind_prompt)
+
+    def test_glm_api_key_enables_default_model_b(self) -> None:
+        responses = [
+            {
+                "score": 5,
+                "reason": "模型 A 首次虚高。",
+                "keywords": ["原子性", "一致性"],
+            },
+            {
+                "score": 5,
+                "reason": "模型 A 纠正后仍然虚高。",
+                "keywords": ["原子性", "一致性"],
+            },
+            {
+                "score": 3,
+                "reason": "GLM 独立判断只覆盖一半。",
+                "keywords": ["原子性", "一致性"],
+            },
+        ]
+        requests = []
+
+        def fake_post(url, headers, body, timeout):
+            requests.append((url, headers, json.loads(body)))
+            return api_response(responses.pop(0))
+
+        environment = {
+            "DEEPSEEK_API_KEY": "deepseek-key",
+            "GLM_API_KEY": "glm-key",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            result = DeepSeekEvaluator(http_post=fake_post).evaluate(
+                "ACID 是什么？", "原子性和一致性", "只提到原子性"
+            )
+
+        self.assertFalse(result.needs_review)
+        self.assertEqual(result.model, "glm-5.1")
+        self.assertEqual(
+            requests[2][0],
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        )
+        self.assertEqual(requests[2][1]["Authorization"], "Bearer glm-key")
+        self.assertEqual(requests[2][2]["model"], "glm-5.1")
+        self.assertEqual(requests[2][2]["thinking"], {"type": "disabled"})
 
     def test_marks_needs_review_only_after_model_b_also_fails(self) -> None:
         requests = []
