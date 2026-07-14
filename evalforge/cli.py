@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .evaluator import DeepSeekEvaluator, EvaluationError, EvaluationResult
+from .evaluator import (
+    DeepSeekEvaluator,
+    EvaluationError,
+    EvaluationResult,
+    GroundednessEvaluationResult,
+)
 from .rag import (
     DEFAULT_RAG_ENTRYPOINT,
     DEFAULT_RAG_PROJECT,
@@ -27,7 +32,10 @@ CASE_COUNT = 3
 @dataclass(frozen=True)
 class RagCaseResult:
     rag_answer: RagAnswer
-    evaluation: EvaluationResult
+    correctness: EvaluationResult
+    retrieval: EvaluationResult
+    groundedness: GroundednessEvaluationResult
+    error_type: str
 
 
 def load_test_cases(path: Path) -> list[dict[str, str]]:
@@ -38,7 +46,7 @@ def load_test_cases(path: Path) -> list[dict[str, str]]:
     except json.JSONDecodeError as exc:
         raise EvaluationError(f"测试数据不是合法 JSON：{path}") from exc
     if not isinstance(data, list) or len(data) != CASE_COUNT:
-        raise EvaluationError(f"v2 测试数据必须恰好包含 {CASE_COUNT} 个问题")
+        raise EvaluationError(f"v2.1 测试数据必须恰好包含 {CASE_COUNT} 个问题")
 
     seen_ids: set[str] = set()
     normalized: list[dict[str, str]] = []
@@ -68,6 +76,7 @@ def evaluate_rag(
     evaluator: DeepSeekEvaluator,
     rag: PythonRagAdapter,
     cases: list[dict[str, str]],
+    threshold: int = 4,
 ) -> dict[str, RagCaseResult]:
     results: dict[str, RagCaseResult] = {}
     for case in cases:
@@ -75,27 +84,93 @@ def evaluate_rag(
         print(f"\n[{question_id}] {case['question']}")
         rag_answer = rag.answer(case["question"])
         print(f"  RAG 回答：{rag_answer.text}")
-        evaluation = evaluator.evaluate(
+        if not rag_answer.trace_available:
+            raise RagIntegrationError(
+                "v2.1 需要 RAG 入口返回检索轨迹，或在入口模块中暴露 route_query 和 retrieve"
+            )
+        print(
+            f"  检索：intent={rag_answer.intent}，改写={rag_answer.rewritten_question}，"
+            f"内容={rag_answer.retrieved_context or '（空）'}"
+        )
+        correctness = evaluator.evaluate(
             case["question"],
             case["reference_answer"],
             rag_answer.text,
             question_id=question_id,
         )
-        score_text = str(evaluation.score) if evaluation.score is not None else "无有效分数"
-        review_text = "，需人工复核" if evaluation.needs_review else ""
-        print(
-            f"  评测：{score_text} 分{review_text}。"
-            f"语义覆盖：{evaluation.semantic_coverage:.0%}，"
-            f"词面重合：{evaluation.lexical_overlap:.0%}。"
-            f"来源：{evaluation.stage}/{evaluation.model}。"
-            f"理由：{evaluation.reason}"
+        retrieval = evaluator.evaluate(
+            case["question"],
+            case["reference_answer"],
+            rag_answer.retrieved_context,
+            question_id=question_id,
         )
-        if evaluation.validation_warnings:
-            print(f"    警告：{'；'.join(evaluation.validation_warnings)}")
-        if evaluation.needs_review:
-            print(f"    复核原因：{'；'.join(evaluation.review_issues)}")
-        results[question_id] = RagCaseResult(rag_answer, evaluation)
+        groundedness = evaluator.evaluate_groundedness(
+            case["question"],
+            rag_answer.retrieved_context,
+            rag_answer.text,
+            question_id=question_id,
+        )
+        error_type = classify_error_type(
+            correctness, retrieval, groundedness, threshold
+        )
+        correctness_text = (
+            str(correctness.score) if correctness.score is not None else "无有效分数"
+        )
+        groundedness_text = (
+            str(groundedness.score)
+            if groundedness.score is not None
+            else "无有效分数"
+        )
+        retrieval_text = (
+            str(retrieval.score) if retrieval.score is not None else "无有效分数"
+        )
+        needs_review = (
+            correctness.needs_review
+            or retrieval.needs_review
+            or groundedness.needs_review
+        )
+        review_text = "，需人工复核" if needs_review else ""
+        print(
+            f"  评测：correctness={correctness_text}，"
+            f"groundedness={groundedness_text}，retrieval={retrieval_text}，"
+            f"error_type={error_type}{review_text}。"
+        )
+        print(f"    正确性理由：{correctness.reason}")
+        print(f"    忠实度理由：{groundedness.reason}")
+        results[question_id] = RagCaseResult(
+            rag_answer,
+            correctness,
+            retrieval,
+            groundedness,
+            error_type,
+        )
     return results
+
+
+def classify_error_type(
+    correctness: EvaluationResult,
+    retrieval: EvaluationResult,
+    groundedness: GroundednessEvaluationResult,
+    threshold: int,
+) -> str:
+    correctness_bad = _evaluation_failed(correctness, threshold)
+    retrieval_bad = _evaluation_failed(retrieval, threshold)
+    groundedness_bad = (
+        groundedness.needs_review
+        or groundedness.score is None
+        or groundedness.score < threshold
+    )
+    if retrieval_bad and groundedness_bad:
+        return "both"
+    if retrieval_bad:
+        return "retrieval"
+    if groundedness_bad or correctness_bad:
+        return "generation"
+    return "none"
+
+
+def _evaluation_failed(result: EvaluationResult, threshold: int) -> bool:
+    return result.needs_review or result.score is None or result.score < threshold
 
 
 def check_rag_acceptance(
@@ -106,12 +181,19 @@ def check_rag_acceptance(
     failures: list[str] = []
     for case in cases:
         question_id = case["question_id"]
-        evaluation = results[question_id].evaluation
-        if evaluation.needs_review or evaluation.score is None:
+        case_result = results[question_id]
+        if (
+            case_result.correctness.needs_review
+            or case_result.retrieval.needs_review
+            or case_result.groundedness.needs_review
+        ):
             failures.append(f"{question_id} 需要人工复核")
-        elif evaluation.score < min_score:
+        elif case_result.error_type != "none":
             failures.append(
-                f"{question_id} 的 RAG 回答为 {evaluation.score} 分，低于门槛 {min_score} 分"
+                f"{question_id} error_type={case_result.error_type}："
+                f"correctness={case_result.correctness.score}，"
+                f"groundedness={case_result.groundedness.score}，"
+                f"retrieval={case_result.retrieval.score}，门槛={min_score}"
             )
     return failures
 
@@ -138,7 +220,12 @@ def _serialize_result(
     case: dict[str, str], case_result: RagCaseResult
 ) -> dict[str, Any]:
     rag_answer = case_result.rag_answer
-    result = case_result.evaluation
+    result = case_result.correctness
+    retrieval = case_result.retrieval
+    groundedness = case_result.groundedness
+    needs_review = (
+        result.needs_review or retrieval.needs_review or groundedness.needs_review
+    )
     return {
         "question_id": case["question_id"],
         "question": case["question"],
@@ -148,7 +235,15 @@ def _serialize_result(
             "project_root": rag_answer.project_root,
             "entrypoint": rag_answer.entrypoint,
             "duration_ms": rag_answer.duration_ms,
+            "intent": rag_answer.intent,
+            "rewritten_question": rag_answer.rewritten_question,
+            "retrieved_context": rag_answer.retrieved_context,
+            "need_human": rag_answer.need_human,
         },
+        "correctness_score": result.score,
+        "groundedness_score": groundedness.score,
+        "error_type": case_result.error_type,
+        "retrieval_score": retrieval.score,
         "final_score": result.score,
         "final_reason": result.reason,
         "semantic_coverage": result.semantic_coverage,
@@ -157,9 +252,13 @@ def _serialize_result(
         "judge_model": result.model,
         "status": result.status,
         "attempt_count": result.attempts,
-        "needs_review": result.needs_review,
+        "needs_review": needs_review,
         "candidate_self_contradiction": result.candidate_self_contradiction,
-        "review_reasons": list(result.review_issues),
+        "review_reasons": [
+            *(f"correctness: {issue}" for issue in result.review_issues),
+            *(f"retrieval: {issue}" for issue in retrieval.review_issues),
+            *(f"groundedness: {issue}" for issue in groundedness.review_issues),
+        ],
         "validation_warnings": list(result.validation_warnings),
         "key_point_judgments": [
             {
@@ -206,11 +305,52 @@ def _serialize_result(
             }
             for attempt in result.reference_history
         ],
+        "retrieval_evaluation": {
+            "score": retrieval.score,
+            "reason": retrieval.reason,
+            "status": retrieval.status,
+            "needs_review": retrieval.needs_review,
+            "attempts": [_serialize_attempt(attempt) for attempt in retrieval.review_history],
+        },
+        "groundedness_evaluation": {
+            "score": groundedness.score,
+            "reason": groundedness.reason,
+            "status": groundedness.status,
+            "needs_review": groundedness.needs_review,
+            "claims": [
+                {
+                    "claim": claim.claim,
+                    "status": claim.status,
+                    "answer_evidence": claim.answer_evidence,
+                    "context_evidence": claim.context_evidence,
+                    "explanation": claim.explanation,
+                }
+                for claim in groundedness.claims
+            ],
+            "attempts": [
+                _serialize_attempt(attempt)
+                for attempt in groundedness.review_history
+            ],
+        },
+    }
+
+
+def _serialize_attempt(attempt: Any) -> dict[str, Any]:
+    return {
+        "stage": attempt.stage,
+        "model": attempt.model,
+        "passed": attempt.passed,
+        "score": attempt.score,
+        "duration_ms": attempt.duration_ms,
+        "token_usage": attempt.token_usage,
+        "raw_result": attempt.raw_result,
+        "issues": list(attempt.issues),
+        "warnings": list(attempt.warnings),
     }
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="EvalForge v2 RAG 系统评测")
+    parser = argparse.ArgumentParser(description="EvalForge v2.1 RAG 归因评测")
     parser.add_argument(
         "--data", type=Path, default=DEFAULT_DATA_PATH, help="三个问题及参考答案的 JSON 文件"
     )
@@ -248,11 +388,11 @@ def main() -> int:
         rag = PythonRagAdapter(args.rag_project, args.rag_entrypoint)
         evaluator = DeepSeekEvaluator()
         print(
-            f"EvalForge v2 开始评测：RAG={rag.entrypoint}，"
+            f"EvalForge v2.1 开始评测：RAG={rag.entrypoint}，"
             f"模型 A={evaluator.model_a}，模型 B={evaluator.model_b}，"
             f"共 {len(cases)} 个问题。"
         )
-        results = evaluate_rag(evaluator, rag, cases)
+        results = evaluate_rag(evaluator, rag, cases, args.min_score)
         save_results(args.output, cases, results)
         print(f"\n结构化结果已保存：{args.output}")
         failures = check_rag_acceptance(cases, results, args.min_score)

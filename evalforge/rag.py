@@ -26,6 +26,11 @@ class RagAnswer:
     duration_ms: int
     project_root: str
     entrypoint: str
+    intent: str | None = None
+    rewritten_question: str | None = None
+    retrieved_context: str = ""
+    need_human: bool | None = None
+    trace_available: bool = False
 
 
 @contextmanager
@@ -98,17 +103,82 @@ class PythonRagAdapter:
         if not isinstance(question, str) or not question.strip():
             raise RagIntegrationError("发送给 RAG 的问题不能为空")
         started = time.perf_counter()
+        trace: dict[str, object] = {
+            "intent": None,
+            "rewritten_question": None,
+            "retrieved_context": "",
+            "need_human": None,
+            "trace_available": False,
+        }
         try:
             with _working_directory(self.project_root):
-                raw_answer = self._answer_callable(question)
+                raw_answer = self._call_with_trace(question, trace)
         except Exception as exc:
             raise RagIntegrationError(f"RAG 回答调用失败：{exc}") from exc
         duration_ms = round((time.perf_counter() - started) * 1000)
-        if not isinstance(raw_answer, str) or not raw_answer.strip():
+        if isinstance(raw_answer, dict):
+            answer_text = raw_answer.get("answer")
+            trace.update(
+                {
+                    "intent": raw_answer.get("intent"),
+                    "rewritten_question": raw_answer.get("rewritten_question"),
+                    "retrieved_context": raw_answer.get("retrieved_context", ""),
+                    "need_human": raw_answer.get("need_human"),
+                    "trace_available": True,
+                }
+            )
+        else:
+            answer_text = raw_answer
+        if not isinstance(answer_text, str) or not answer_text.strip():
             raise RagIntegrationError("RAG Python 接口返回了空答案或非字符串")
+        retrieved_context = trace["retrieved_context"]
+        if not isinstance(retrieved_context, str):
+            raise RagIntegrationError("RAG 检索内容必须是字符串")
         return RagAnswer(
-            text=raw_answer.strip(),
+            text=answer_text.strip(),
             duration_ms=duration_ms,
             project_root=str(self.project_root),
             entrypoint=self.entrypoint,
+            intent=trace["intent"] if isinstance(trace["intent"], str) else None,
+            rewritten_question=trace["rewritten_question"]
+            if isinstance(trace["rewritten_question"], str)
+            else None,
+            retrieved_context=retrieved_context.strip(),
+            need_human=trace["need_human"]
+            if isinstance(trace["need_human"], bool)
+            else None,
+            trace_available=bool(trace["trace_available"]),
         )
+
+    def _call_with_trace(
+        self, question: str, trace: dict[str, object]
+    ) -> object:
+        function_globals = getattr(self._answer_callable, "__globals__", None)
+        if not isinstance(function_globals, dict):
+            return self._answer_callable(question)
+        route_function = function_globals.get("route_query")
+        retrieve_function = function_globals.get("retrieve")
+        if not callable(route_function) or not callable(retrieve_function):
+            return self._answer_callable(question)
+
+        def traced_route(text: str) -> object:
+            route = route_function(text)
+            if isinstance(route, dict):
+                trace["intent"] = route.get("intent")
+                trace["rewritten_question"] = route.get("query_rewrite")
+                trace["need_human"] = route.get("need_human")
+            return route
+
+        def traced_retrieve(query: str, intent: str) -> object:
+            context = retrieve_function(query, intent)
+            trace["retrieved_context"] = context
+            return context
+
+        trace["trace_available"] = True
+        function_globals["route_query"] = traced_route
+        function_globals["retrieve"] = traced_retrieve
+        try:
+            return self._answer_callable(question)
+        finally:
+            function_globals["route_query"] = route_function
+            function_globals["retrieve"] = retrieve_function

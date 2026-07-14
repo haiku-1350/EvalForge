@@ -8,10 +8,17 @@ from unittest.mock import patch
 from evalforge.cli import (
     RagCaseResult,
     check_rag_acceptance,
+    classify_error_type,
     load_test_cases,
     save_results,
 )
-from evalforge.evaluator import DeepSeekEvaluator, EvaluationError, EvaluationResult
+from evalforge.evaluator import (
+    DeepSeekEvaluator,
+    EvaluationError,
+    EvaluationResult,
+    GroundednessEvaluationResult,
+)
+from evalforge.grounding import GroundingClaim, review_grounding_result
 from evalforge.rag import PythonRagAdapter, RagAnswer, RagIntegrationError
 from evalforge.reviewer import (
     KeyPoint,
@@ -95,6 +102,31 @@ def judge_payload(
         "reason": "核心事实正确，仅遗漏补充信息。",
         "uncertain": uncertain,
         "uncertainty_reasons": ["答案内部立场矛盾"] if uncertain else [],
+    }
+
+
+def grounding_payload(
+    *, score: int = 5, status: str = "supported", uncertain: bool = False
+) -> dict:
+    context_evidence = "列表创建后可以修改元素" if status in {
+        "supported",
+        "partially_supported",
+    } else None
+    return {
+        "question_id": QUESTION_ID,
+        "claims": [
+            {
+                "claim": "列表可以修改",
+                "status": status,
+                "answer_evidence": "列表可以修改",
+                "context_evidence": context_evidence,
+                "explanation": "检索内容支持该陈述",
+            }
+        ],
+        "groundedness_score": score,
+        "reason": "回答中的事实有检索依据。",
+        "uncertain": uncertain,
+        "uncertainty_reasons": ["支持关系不清晰"] if uncertain else [],
     }
 
 
@@ -385,6 +417,95 @@ class EvaluatorTests(unittest.TestCase):
                     QUESTION, REFERENCE, CANDIDATE, question_id=QUESTION_ID
                 )
 
+    def test_accepts_groundedness_result_from_model_a(self) -> None:
+        def fake_post(url, headers, body, timeout):
+            return api_response(grounding_payload())
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "a-key"}, clear=True):
+            result = DeepSeekEvaluator(http_post=fake_post).evaluate_groundedness(
+                QUESTION,
+                REFERENCE,
+                CANDIDATE,
+                question_id=QUESTION_ID,
+            )
+
+        self.assertEqual(result.score, 5)
+        self.assertEqual(result.status, "accepted_model_a")
+        self.assertEqual(result.claims[0].status, "supported")
+
+    def test_groundedness_uses_model_b_after_failed_correction(self) -> None:
+        responses = [
+            grounding_payload(score=5, status="unsupported"),
+            grounding_payload(score=5, status="unsupported"),
+            grounding_payload(),
+        ]
+        requests = []
+
+        def fake_post(url, headers, body, timeout):
+            requests.append(json.loads(body))
+            return api_response(responses.pop(0))
+
+        environment = {"DEEPSEEK_API_KEY": "a-key", **MODEL_B_ENV}
+        with patch.dict(os.environ, environment, clear=True):
+            result = DeepSeekEvaluator(http_post=fake_post).evaluate_groundedness(
+                QUESTION,
+                REFERENCE,
+                CANDIDATE,
+                question_id=QUESTION_ID,
+            )
+
+        self.assertEqual(result.status, "accepted_model_b")
+        self.assertEqual(result.model, "glm-5.1")
+        blind_prompt = requests[2]["messages"][1]["content"]
+        self.assertNotIn("上一次", blind_prompt)
+
+
+class GroundingReviewerTests(unittest.TestCase):
+    def test_accepts_supported_claim_with_exact_evidence(self) -> None:
+        report = review_grounding_result(
+            grounding_payload(), QUESTION_ID, REFERENCE, CANDIDATE
+        )
+        self.assertTrue(report.acceptable)
+        self.assertEqual(report.score, 5)
+
+    def test_rejects_context_evidence_not_in_retrieval(self) -> None:
+        payload = grounding_payload()
+        payload["claims"][0]["context_evidence"] = "不存在的检索原文"
+        report = review_grounding_result(
+            payload, QUESTION_ID, REFERENCE, CANDIDATE
+        )
+        self.assertTrue(any("context_evidence" in issue for issue in report.issues))
+
+    def test_score_five_rejects_unsupported_claim(self) -> None:
+        report = review_grounding_result(
+            grounding_payload(score=5, status="unsupported"),
+            QUESTION_ID,
+            REFERENCE,
+            CANDIDATE,
+        )
+        self.assertTrue(any("score_state_conflict" in issue for issue in report.issues))
+
+    def test_empty_context_allows_honest_non_factual_abstention(self) -> None:
+        answer = "目前没有相关信息。"
+        payload = {
+            "question_id": QUESTION_ID,
+            "claims": [
+                {
+                    "claim": "没有相关信息",
+                    "status": "non_factual",
+                    "answer_evidence": answer,
+                    "context_evidence": None,
+                    "explanation": "这是对空检索结果的诚实说明",
+                }
+            ],
+            "groundedness_score": 5,
+            "reason": "没有编造事实。",
+            "uncertain": False,
+            "uncertainty_reasons": [],
+        }
+        report = review_grounding_result(payload, QUESTION_ID, "", answer)
+        self.assertTrue(report.acceptable)
+
 
 class CliTests(unittest.TestCase):
     def test_bundled_data_contains_exactly_three_rag_questions(self) -> None:
@@ -424,19 +545,42 @@ class CliTests(unittest.TestCase):
             stage="model_b_blind",
             status="accepted_model_b",
         )
-        cases = [{
-            "question_id": QUESTION_ID,
-            "question": QUESTION,
-            "reference_answer": REFERENCE,
-        }]
+        cases = [
+            {
+                "question_id": QUESTION_ID,
+                "question": QUESTION,
+                "reference_answer": REFERENCE,
+            }
+        ]
+        groundedness = GroundednessEvaluationResult(
+            score=5,
+            reason="所有事实均有检索支持。",
+            claims=(
+                GroundingClaim(
+                    "列表可以修改",
+                    "supported",
+                    "列表可以修改",
+                    "列表创建后可以修改元素",
+                    "语义支持",
+                ),
+            ),
+        )
         case_result = RagCaseResult(
             rag_answer=RagAnswer(
                 text=CANDIDATE,
                 duration_ms=123,
                 project_root=r"E:\Enterprise AI Helpdesk",
                 entrypoint="utils.answer:answer_user",
+                intent="IT",
+                rewritten_question=QUESTION,
+                retrieved_context=REFERENCE,
+                need_human=False,
+                trace_available=True,
             ),
-            evaluation=result,
+            correctness=result,
+            retrieval=EvaluationResult(score=5, reason="检索完整。"),
+            groundedness=groundedness,
+            error_type="none",
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "result.json"
@@ -444,6 +588,10 @@ class CliTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(payload[0]["rag_answer"], CANDIDATE)
         self.assertEqual(payload[0]["rag_call"]["duration_ms"], 123)
+        self.assertEqual(payload[0]["correctness_score"], 4)
+        self.assertEqual(payload[0]["groundedness_score"], 5)
+        self.assertEqual(payload[0]["error_type"], "none")
+        self.assertEqual(payload[0]["retrieval_score"], 5)
         self.assertEqual(payload[0]["judge_source"], "model_b_blind")
         self.assertEqual(payload[0]["semantic_coverage"], 1.0)
         self.assertEqual(payload[0]["key_point_judgments"][0]["id"], "K1")
@@ -455,10 +603,23 @@ class CliTests(unittest.TestCase):
         case_result = RagCaseResult(
             RagAnswer(CANDIDATE, 1, "demo", "demo:answer"),
             EvaluationResult(score=3, reason="不完整"),
+            EvaluationResult(score=5, reason="检索完整"),
+            GroundednessEvaluationResult(score=5, reason="有依据"),
+            "generation",
         )
         failures = check_rag_acceptance(cases, {QUESTION_ID: case_result}, 4)
         self.assertEqual(len(failures), 1)
-        self.assertIn("低于门槛 4 分", failures[0])
+        self.assertIn("error_type=generation", failures[0])
+
+    def test_error_type_classification_matrix(self) -> None:
+        good = EvaluationResult(score=5, reason="通过")
+        bad = EvaluationResult(score=0, reason="失败")
+        grounded = GroundednessEvaluationResult(score=5, reason="有依据")
+        ungrounded = GroundednessEvaluationResult(score=0, reason="无依据")
+        self.assertEqual(classify_error_type(good, good, grounded, 4), "none")
+        self.assertEqual(classify_error_type(bad, bad, grounded, 4), "retrieval")
+        self.assertEqual(classify_error_type(bad, good, grounded, 4), "generation")
+        self.assertEqual(classify_error_type(bad, bad, ungrounded, 4), "both")
 
 
 class RagAdapterTests(unittest.TestCase):
@@ -468,8 +629,16 @@ class RagAdapterTests(unittest.TestCase):
             root = Path(directory)
             (root / f"{module_name}.py").write_text(
                 "from pathlib import Path\n"
+                "def route_query(question):\n"
+                "    return {'intent': 'IT', 'query_rewrite': question, 'need_human': False}\n"
+                "def retrieve(query, intent):\n"
+                "    return '检索内容'\n"
+                "def generate_answer(query, docs):\n"
+                "    return f'{Path.cwd().name}:{query}'\n"
                 "def answer(question):\n"
-                "    return f'{Path.cwd().name}:{question}'\n",
+                "    route = route_query(question)\n"
+                "    docs = retrieve(route['query_rewrite'], route['intent'])\n"
+                "    return generate_answer(route['query_rewrite'], docs)\n",
                 encoding="utf-8",
             )
             try:
@@ -482,6 +651,9 @@ class RagAdapterTests(unittest.TestCase):
                 sys.modules.pop(module_name, None)
         self.assertEqual(result.text, f"{root.name}:测试问题")
         self.assertEqual(result.entrypoint, f"{module_name}:answer")
+        self.assertEqual(result.intent, "IT")
+        self.assertEqual(result.retrieved_context, "检索内容")
+        self.assertTrue(result.trace_available)
         self.assertFalse(cache_created)
 
     def test_rejects_empty_rag_answer(self) -> None:

@@ -1,12 +1,14 @@
-"""EvalForge v2: evaluate live answers from a Python-connected RAG system."""
+"""EvalForge v2.1: score correctness, groundedness, and RAG error type."""
 
 from .evaluator import (
     DeepSeekEvaluator,
     EvaluationAttempt,
     EvaluationError,
     EvaluationResult,
+    GroundednessEvaluationResult,
     PreparedReference,
 )
+from .grounding import GroundingClaim, GroundingReport, review_grounding_result
 from .reviewer import (
     ExtraClaim,
     KeyPoint,
@@ -23,6 +25,7 @@ __all__ = [
     "EvaluationAttempt",
     "EvaluationError",
     "EvaluationResult",
+    "GroundednessEvaluationResult",
     "PreparedReference",
     "ExtraClaim",
     "KeyPoint",
@@ -34,4 +37,7 @@ __all__ = [
     "PythonRagAdapter",
     "RagAnswer",
     "RagIntegrationError",
+    "GroundingClaim",
+    "GroundingReport",
+    "review_grounding_result",
 ]
